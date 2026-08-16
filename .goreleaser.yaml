@@ -1,0 +1,42 @@
+version: 2
+
+project_name: turingtap-agent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: turingtap-agent
+    main: ./cmd/turingtap-agent
+    binary: turingtap-agent
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+# Signing intentionally omitted for v1 (see docs/08-roadmap.md).

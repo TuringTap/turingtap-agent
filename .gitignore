@@ -1,0 +1,22 @@
+# Binaries
+/turingtap-agent
+/bin/
+/dist/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.*
+
+# go-rod downloads Chromium here at runtime
+/.cache/
+rod/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local config
+agent.toml

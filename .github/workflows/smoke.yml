@@ -1,0 +1,99 @@
+name: smoke
+# Post-release smoke test: install the published agent on all three OSes,
+# check `--version` matches the release tag, and verify relay connectivity.
+# Runs after goreleaser has uploaded assets — the install script downloads
+# from releases/latest, so ordering matters. `release: published` alone is not
+# enough: goreleaser publishes with GITHUB_TOKEN, and GITHUB_TOKEN-created
+# events never trigger workflows, so we also chain off the release workflow
+# run completing (which is likewise post-upload).
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    # For workflow_run, only smoke-test successful release builds.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          tag='${{ github.event.release.tag_name }}'
+          if [ -z "$tag" ] && [ '${{ github.event_name }}' = 'workflow_run' ]; then
+            # for tag-push runs, head_branch holds the tag name
+            tag='${{ github.event.workflow_run.head_branch }}'
+          fi
+          if [ -z "$tag" ]; then
+            # workflow_dispatch: smoke-test the latest published release
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "testing release $tag"
+
+      - name: Install via install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: curl -fsSL https://turingtap.ai/install.sh | sh
+
+      - name: Check --version
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # installer lands in /usr/local/bin, or ~/.local/bin without sudo
+          export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+          out=$(turingtap-agent --version)
+          echo "reported: $out"
+          case "$out" in
+            *'${{ steps.tag.outputs.version }}'*) echo "version OK" ;;
+            *) echo "expected '${{ steps.tag.outputs.version }}', got: $out" >&2; exit 1 ;;
+          esac
+
+      - name: Download zip and check --version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $ver = '${{ steps.tag.outputs.version }}'
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern '*windows_amd64.zip' --dir .
+          if ($LASTEXITCODE -ne 0) { throw "gh release download exited $LASTEXITCODE" }
+          $zip = Get-ChildItem -Filter '*windows_amd64.zip' | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath agent
+          $exe = Get-ChildItem -Path agent -Recurse -Filter 'turingtap-agent.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'turingtap-agent.exe not found in archive' }
+          $out = & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "--version exited $LASTEXITCODE" }
+          Write-Host "reported: $out"
+          if ("$out" -notlike "*$ver*") { throw "expected '$ver', got: $out" }
+          Write-Host 'version OK'
+
+      - name: Relay health
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://relay.turingtap.ai/health)
+          echo "relay health: HTTP $code"
+          [ "$code" = "200" ]
+
+      - name: Relay health (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $resp = Invoke-WebRequest -Uri 'https://relay.turingtap.ai/health' -UseBasicParsing
+          Write-Host "relay health: HTTP $($resp.StatusCode)"
+          if ($resp.StatusCode -ne 200) { throw "expected 200, got $($resp.StatusCode)" }
