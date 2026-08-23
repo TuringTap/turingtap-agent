@@ -1,0 +1,17 @@
+#!/bin/sh
+# postinstall -- load the TuringTap Agent LaunchAgent for the console user.
+#
+# Runs as root from the installer. Bootstrapping can fail (nobody logged in
+# at the console, agent already loaded, install driven over SSH); that is
+# non-fatal -- the LaunchAgent loads at next login regardless.
+PLIST=/Library/LaunchAgents/ai.turingtap.agent.plist
+
+uid=$(stat -f %u /dev/console 2>/dev/null || true)
+if [ -n "$uid" ] && [ "$uid" != "0" ]; then
+  launchctl bootstrap "gui/$uid" "$PLIST" 2>/dev/null || \
+    echo "launchctl bootstrap failed; agent will load at next login"
+fi
+
+echo "TuringTap Agent installed: /usr/local/bin/turingtap-agent"
+echo "Config: ~/.turingtap/agent.toml (created on first run with --api-key)"
+exit 0

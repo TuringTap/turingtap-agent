@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Template for productbuild; scripts/build-pkg.sh substitutes
+     @VERSION@ (x.y.z) and @ARCH@ (arm64 or x86_64). -->
+<installer-gui-script minSpecVersion="2">
+    <title>TuringTap Agent</title>
+    <options customize="never" require-scripts="false" hostArchitectures="@ARCH@"/>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="ai.turingtap.agent"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="ai.turingtap.agent" visible="false">
+        <pkg-ref id="ai.turingtap.agent"/>
+    </choice>
+    <pkg-ref id="ai.turingtap.agent" version="@VERSION@" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>

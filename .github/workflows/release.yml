@@ -1,0 +1,252 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Re-signs the darwin tarballs with a Developer ID certificate, notarizes
+  # them, regenerates checksums.txt, and GPG-signs it. Each half is gated on
+  # its secrets being present, so the release still works without them.
+  #
+  # Secrets:
+  #   DEVID_KEY_B64                base64 of the Developer ID private key (PEM)
+  #   DEVID_CERT_B64               base64 of the Developer ID certificate (PEM)
+  #   APP_STORE_CONNECT_KEY_ID     App Store Connect API key ID
+  #   APP_STORE_CONNECT_ISSUER_ID  App Store Connect API issuer ID (UUID)
+  #   APP_STORE_CONNECT_KEY_P8     base64 of the AuthKey_<KEY_ID>.p8 file
+  #   GPG_SIGNING_KEY_B64          base64 of the armored GPG secret key
+  #                                (public half: RELEASES.pub.asc in the repo)
+  sign:
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      HAVE_DEVID: ${{ secrets.DEVID_KEY_B64 != '' && secrets.DEVID_CERT_B64 != '' && secrets.APP_STORE_CONNECT_KEY_P8 != '' }}
+      HAVE_GPG: ${{ secrets.GPG_SIGNING_KEY_B64 != '' }}
+      APPLE_CODESIGN_VERSION: "0.29.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        run: |
+          mkdir dist
+          gh release download "$TAG" --dir dist
+          ls -l dist
+
+      - name: Install rcodesign
+        if: env.HAVE_DEVID == 'true'
+        run: |
+          curl -fsSL -o /tmp/rcodesign.tar.gz \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${APPLE_CODESIGN_VERSION}/apple-codesign-${APPLE_CODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp
+          sudo install -m 0755 \
+            "/tmp/apple-codesign-${APPLE_CODESIGN_VERSION}-x86_64-unknown-linux-musl/rcodesign" \
+            /usr/local/bin/rcodesign
+          rcodesign --version
+
+      - name: Sign and notarize darwin tarballs
+        if: env.HAVE_DEVID == 'true'
+        env:
+          DEVID_KEY_B64: ${{ secrets.DEVID_KEY_B64 }}
+          DEVID_CERT_B64: ${{ secrets.DEVID_CERT_B64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          keydir=$(mktemp -d)
+          printf '%s' "$DEVID_KEY_B64"  | base64 -d > "$keydir/devid.key"
+          printf '%s' "$DEVID_CERT_B64" | base64 -d > "$keydir/devid.crt"
+          printf '%s' "$APP_STORE_CONNECT_KEY_P8" | base64 -d > "$keydir/asc.p8"
+          rcodesign encode-app-store-connect-api-key -o "$keydir/asc.json" \
+            "$APP_STORE_CONNECT_ISSUER_ID" "$APP_STORE_CONNECT_KEY_ID" "$keydir/asc.p8"
+          DEVID_KEY="$keydir/devid.key" DEVID_CERT="$keydir/devid.crt" \
+            ASC_API_KEY_JSON="$keydir/asc.json" \
+            scripts/sign-macos.sh dist/*darwin*.tar.gz
+          rm -rf "$keydir"
+
+      - name: Regenerate checksums.txt
+        if: env.HAVE_DEVID == 'true'
+        run: |
+          cd dist
+          rm -f checksums.txt checksums.txt.asc
+          sha256sum -- * > checksums.txt
+          cat checksums.txt
+
+      - name: GPG-sign checksums.txt
+        if: env.HAVE_GPG == 'true'
+        env:
+          GPG_SIGNING_KEY_B64: ${{ secrets.GPG_SIGNING_KEY_B64 }}
+        run: |
+          export GNUPGHOME=$(mktemp -d)
+          printf '%s' "$GPG_SIGNING_KEY_B64" | base64 -d | gpg --batch --import
+          gpg --batch --yes --armor --detach-sign \
+            --output dist/checksums.txt.asc dist/checksums.txt
+          gpg --verify dist/checksums.txt.asc dist/checksums.txt
+          rm -rf "$GNUPGHOME"
+
+      - name: Upload re-signed assets
+        if: env.HAVE_DEVID == 'true' || env.HAVE_GPG == 'true'
+        run: |
+          cd dist
+          files="checksums.txt"
+          [ -f checksums.txt.asc ] && files="$files checksums.txt.asc"
+          if [ "$HAVE_DEVID" = "true" ]; then
+            files="$files $(ls -- *darwin*.tar.gz)"
+          fi
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" --clobber $files
+
+  # Builds macOS .pkg installers (one per arch) from the darwin tarballs,
+  # signs them with a Developer ID Installer certificate via rcodesign (no
+  # keychain import needed), and notarizes them when a Developer ID
+  # Application certificate is also configured (pkg contents must be signed
+  # for notarization to pass). Runs on macOS because pkgbuild/productbuild
+  # are macOS-only.
+  #
+  # Ordering: runs after `sign` so the tarballs it downloads already contain
+  # Application-signed binaries when that cert exists, and so the final
+  # checksums.txt regeneration (covering the .pkg files) + GPG signature
+  # happen exactly once, here, last.
+  #
+  # Additional secrets:
+  #   DEVID_INSTALLER_KEY_B64   base64 of the Developer ID Installer
+  #                             private key (PEM)
+  #   DEVID_INSTALLER_CERT_B64  base64 of the Developer ID Installer
+  #                             certificate (PEM)
+  pkg:
+    needs: [goreleaser, sign]
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      HAVE_DEVID_APP: ${{ secrets.DEVID_KEY_B64 != '' && secrets.DEVID_CERT_B64 != '' && secrets.APP_STORE_CONNECT_KEY_P8 != '' }}
+      HAVE_INSTALLER: ${{ secrets.DEVID_INSTALLER_KEY_B64 != '' && secrets.DEVID_INSTALLER_CERT_B64 != '' }}
+      HAVE_GPG: ${{ secrets.GPG_SIGNING_KEY_B64 != '' }}
+      APPLE_CODESIGN_VERSION: "0.29.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        run: |
+          mkdir dist
+          gh release download "$TAG" --dir dist
+          ls -l dist
+
+      - name: Install rcodesign
+        run: |
+          curl -fsSL -o /tmp/rcodesign.tar.gz \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${APPLE_CODESIGN_VERSION}/apple-codesign-${APPLE_CODESIGN_VERSION}-macos-universal.tar.gz"
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp
+          sudo install -m 0755 \
+            "/tmp/apple-codesign-${APPLE_CODESIGN_VERSION}-macos-universal/rcodesign" \
+            /usr/local/bin/rcodesign
+          rcodesign --version
+
+      - name: Build .pkg installers
+        env:
+          DEVID_KEY_B64: ${{ secrets.DEVID_KEY_B64 }}
+          DEVID_CERT_B64: ${{ secrets.DEVID_CERT_B64 }}
+        run: |
+          ver="${TAG#v}"
+          keydir=$(mktemp -d)
+          if [ "$HAVE_DEVID_APP" = "true" ]; then
+            printf '%s' "$DEVID_KEY_B64"  | base64 -d > "$keydir/devid.key"
+            printf '%s' "$DEVID_CERT_B64" | base64 -d > "$keydir/devid.crt"
+            export DEVID_KEY="$keydir/devid.key" DEVID_CERT="$keydir/devid.crt"
+          fi
+          for arch in arm64 amd64; do
+            VERSION="$ver" scripts/build-pkg.sh \
+              "dist/turingtap-agent_${ver}_darwin_${arch}.tar.gz" \
+              "dist/turingtap-agent_${ver}_darwin_${arch}.pkg"
+          done
+          rm -rf "$keydir"
+
+      - name: Sign .pkg (Developer ID Installer)
+        if: env.HAVE_INSTALLER == 'true'
+        env:
+          DEVID_INSTALLER_KEY_B64: ${{ secrets.DEVID_INSTALLER_KEY_B64 }}
+          DEVID_INSTALLER_CERT_B64: ${{ secrets.DEVID_INSTALLER_CERT_B64 }}
+        run: |
+          keydir=$(mktemp -d)
+          printf '%s' "$DEVID_INSTALLER_KEY_B64"  | base64 -d > "$keydir/installer.key"
+          printf '%s' "$DEVID_INSTALLER_CERT_B64" | base64 -d > "$keydir/installer.crt"
+          for p in dist/*.pkg; do
+            # rcodesign signs flat packages in place
+            rcodesign sign \
+              --pem-file "$keydir/installer.key" \
+              --pem-file "$keydir/installer.crt" \
+              "$p"
+            pkgutil --check-signature "$p"
+          done
+          rm -rf "$keydir"
+
+      - name: Notarize .pkg
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          if [ "$HAVE_DEVID_APP" != "true" ] || [ "$HAVE_INSTALLER" != "true" ]; then
+            echo "notarization skipped: no Developer ID Application cert"
+            exit 0
+          fi
+          keydir=$(mktemp -d)
+          printf '%s' "$APP_STORE_CONNECT_KEY_P8" | base64 -d > "$keydir/asc.p8"
+          rcodesign encode-app-store-connect-api-key -o "$keydir/asc.json" \
+            "$APP_STORE_CONNECT_ISSUER_ID" "$APP_STORE_CONNECT_KEY_ID" "$keydir/asc.p8"
+          for p in dist/*.pkg; do
+            # Best-effort staple: Apple's queue can hold submissions
+            # InProgress for hours (first-time teams especially). On
+            # timeout, ship without the staple -- Gatekeeper falls back to
+            # an online ticket lookup once processing finishes.
+            if ! rcodesign notary-submit --api-key-file "$keydir/asc.json" \
+                --max-wait-seconds 900 --staple "$p"; then
+              echo "warning: notarization did not complete for $p; shipping without staple"
+            fi
+          done
+          rm -rf "$keydir"
+
+      - name: Regenerate checksums.txt
+        run: |
+          cd dist
+          rm -f checksums.txt checksums.txt.asc
+          shasum -a 256 -- * > checksums.txt
+          cat checksums.txt
+
+      - name: GPG-sign checksums.txt
+        if: env.HAVE_GPG == 'true'
+        env:
+          GPG_SIGNING_KEY_B64: ${{ secrets.GPG_SIGNING_KEY_B64 }}
+        run: |
+          export GNUPGHOME=$(mktemp -d)
+          printf '%s' "$GPG_SIGNING_KEY_B64" | base64 -d | gpg --batch --import
+          gpg --batch --yes --armor --detach-sign \
+            --output dist/checksums.txt.asc dist/checksums.txt
+          gpg --verify dist/checksums.txt.asc dist/checksums.txt
+          rm -rf "$GNUPGHOME"
+
+      - name: Upload .pkg and checksums
+        run: |
+          cd dist
+          files="checksums.txt $(ls -- *.pkg)"
+          [ -f checksums.txt.asc ] && files="$files checksums.txt.asc"
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" --clobber $files
